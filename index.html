@@ -1616,6 +1616,20 @@ img,video{display:block}
         </div>
       </div>
 
+      <!-- Backup -->
+      <div class="settings-section">
+        <div class="settings-section-title">Backup</div>
+        <p class="form-hint" style="margin-bottom:14px">
+          Salve personagens, personas, lores, chats, mensagens e aparência em um arquivo JSON, ou abra um backup existente.
+          Chaves privadas de APIs não são incluídas.
+        </p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn-primary" onclick="exportBackup()">Fazer backup</button>
+          <button class="btn-secondary" onclick="document.getElementById('backup-file').click()">Abrir backup</button>
+          <input type="file" id="backup-file" accept="application/json,.json" style="display:none" onchange="importBackup(event)">
+        </div>
+      </div>
+
       <!-- Theme -->
       <div class="settings-section">
         <div class="settings-section-title">Theme</div>
@@ -2132,11 +2146,12 @@ img,video{display:block}
 <script>
 'use strict';
 
-// Supabase Storage exclusivo deste duplicado.
+// Supabase exclusivo deste duplicado.
 window.LOREWEAVE_SUPABASE = {
   url: 'https://vluidoyzsrgbotshherb.supabase.co',
   anonKey: 'sb_publishable_tbc_nGa3-TC5pT_mMtm07w_ngTat30B',
-  bucket: 'media'
+  bucket: 'media',
+  userId: 'loreweave-duplicado-principal'
 };
 
 // ============================================
@@ -2331,7 +2346,7 @@ const DIRECTION_FIELDS = [
 ];
 
 // ============================================
-// SESSION-ONLY STATE (NO STORAGE)
+// SUPABASE STATE SYNC
 // ============================================
 
 function normalizeProviders() {
@@ -2363,13 +2378,89 @@ function normalizeProviders() {
   if(!S.providers.some(p=>p.id===S.activeProviderId)) S.activeProviderId='openrouter';
 }
 
-// Changes remain in memory only and disappear on reload/close.
+let _saveTimer = null;
+let _saveInFlight = null;
+
+function getSupabaseDataConfig() {
+  const config = window.LOREWEAVE_SUPABASE || {};
+  const url = String(config.url || '').replace(/\/$/, '');
+  const anonKey = String(config.anonKey || '').trim();
+  const userId = String(config.userId || 'loreweave-duplicado-principal').trim();
+  if(!url || !anonKey || !userId) throw new Error('Configuração Supabase incompleta.');
+  return {url, anonKey, userId};
+}
+
+function stateSnapshot() {
+  const snapshot = JSON.parse(JSON.stringify(S));
+  delete snapshot.provider;
+
+  // Chaves de serviços de IA não devem ser gravadas numa tabela pública.
+  snapshot.fishKey = '';
+  if(Array.isArray(snapshot.providers)) {
+    snapshot.providers = snapshot.providers.map(provider => ({...provider, apiKey: ''}));
+  }
+  return snapshot;
+}
+
+async function persistState(keepalive=false) {
+  if(_saveInFlight) await _saveInFlight;
+  const {url, anonKey, userId} = getSupabaseDataConfig();
+  const body = JSON.stringify({
+    user_id: userId,
+    data: stateSnapshot(),
+    updated_at: new Date().toISOString()
+  });
+
+  _saveInFlight = fetch(`${url}/rest/v1/user_data?on_conflict=user_id`, {
+    method: 'POST',
+    headers: {
+      apikey: anonKey,
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates,return=minimal'
+    },
+    body,
+    keepalive
+  }).then(async response => {
+    if(!response.ok) {
+      let detail='';
+      try { detail=(await response.json()).message||''; } catch(_) {}
+      throw new Error(detail || `Falha ao salvar (${response.status})`);
+    }
+    showSyncStatus('✓ Salvo no Supabase', true);
+  }).finally(() => { _saveInFlight = null; });
+
+  return _saveInFlight;
+}
+
 function save() {
-  // Intentionally empty: this build never persists user data.
+  clearTimeout(_saveTimer);
+  showSyncStatus('Salvando…');
+  _saveTimer = setTimeout(() => {
+    persistState().catch(err => {
+      console.error('Supabase save failed:', err);
+      showSyncStatus('Erro ao salvar');
+      showToast(err.message, 'error');
+    });
+  }, 500);
 }
 
 async function load() {
+  const {url, anonKey, userId} = getSupabaseDataConfig();
+  const query = `${url}/rest/v1/user_data?user_id=eq.${encodeURIComponent(userId)}&select=data&limit=1`;
+  const response = await fetch(query, {headers:{apikey:anonKey}});
+  if(!response.ok) {
+    let detail='';
+    try { detail=(await response.json()).message||''; } catch(_) {}
+    throw new Error(detail || `Falha ao carregar (${response.status})`);
+  }
+  const rows = await response.json();
+  if(rows[0]?.data && typeof rows[0].data === 'object') {
+    const remote = rows[0].data;
+    delete remote.provider;
+    Object.assign(S, remote);
+  }
   normalizeProviders();
+  return rows.length > 0;
 }
 
 // ============================================
@@ -4812,6 +4903,64 @@ function loadSettingsUI() {
 }
 
 // ============================================
+// BACKUP
+// ============================================
+function exportBackup() {
+  const backup = {
+    format: 'loreweave-backup',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    data: stateSnapshot()
+  };
+  const blob = new Blob([JSON.stringify(backup, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `loreweave-backup-${new Date().toISOString().slice(0,10)}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast('Backup criado', 'success');
+}
+
+async function importBackup(event) {
+  const input = event.target;
+  const file = input.files?.[0];
+  input.value = '';
+  if(!file) return;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(await file.text());
+  } catch(_) {
+    showToast('Arquivo de backup inválido', 'error');
+    return;
+  }
+
+  const data = parsed?.format === 'loreweave-backup' ? parsed.data : parsed;
+  if(!data || typeof data !== 'object' || Array.isArray(data)) {
+    showToast('Este arquivo não contém um backup Loreweave válido', 'error');
+    return;
+  }
+
+  openConfirm('Abrir backup', 'Isso substituirá os dados atuais e sincronizará o backup com o Supabase. Continuar?', async () => {
+    try {
+      const restored = JSON.parse(JSON.stringify(data));
+      delete restored.provider;
+      Object.assign(S, restored);
+      normalizeProviders();
+      await persistState();
+      showToast('Backup restaurado', 'success');
+      setTimeout(() => location.reload(), 350);
+    } catch(err) {
+      console.error('Backup restore failed:', err);
+      showToast(`Falha ao abrir backup: ${err.message}`, 'error');
+    }
+  });
+}
+
+// ============================================
 // THEME SYSTEM
 // ============================================
 const THEME_VARS={
@@ -5107,9 +5256,16 @@ function renderEditHistory() {
 // INIT
 // ============================================
 async function init() {
-  showSyncStatus('Session only');
-  await load();
-  save();
+  showSyncStatus('Carregando do Supabase…');
+  try {
+    const found = await load();
+    if(!found) await persistState();
+  } catch(err) {
+    console.error('Supabase load failed:', err);
+    showSyncStatus('Erro de sincronização');
+    showToast(err.message, 'error');
+    normalizeProviders();
+  }
   loadTheme();
   populateSelects();
   renderChatList();
@@ -5120,8 +5276,13 @@ async function init() {
   if(S.activeChatId && S.chats.find(x=>x.id===S.activeChatId)) {
     openChat(S.activeChatId);
   }
-  showSyncStatus('✓ Nothing saved', true);
+  showSyncStatus('✓ Sincronizado', true);
 }
+
+window.addEventListener('pagehide', () => {
+  clearTimeout(_saveTimer);
+  persistState(true).catch(() => {});
+});
 
 document.addEventListener('click', e=>{
   if(!e.target.closest('#msg-menu') && !e.target.closest('.msg-wrap')) closeMsgMenu();
